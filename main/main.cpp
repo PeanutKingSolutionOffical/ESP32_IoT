@@ -44,6 +44,7 @@ This is necessary to prevent the I2C slave from blocking the master when it is n
 #define WIFI_PASS_MAXLEN 64 + 1 // max password length is 64 characters, +1 for null-terminator, see IEEE802.11
 #define MDNS_NAME_MAXLEN 32     // max mDNS name length is 32 characters
 #define SENSOR_NAME_MAXLEN 32   // max sensor name length is 32 characters
+#define SENSOR_NUM 5
 
 #define CMD_MDNS_NAME 0x30
 #define CMD_WIFI_SSID 0x31
@@ -77,9 +78,10 @@ typedef struct
     bool wifi_started;
     SemaphoreHandle_t ret_cmd_mutex;
     SemaphoreHandle_t sensor_mutex;
+    SemaphoreHandle_t name_mutex;
     httpd_handle_t http_server;
-    float sensor_data[8];
-    char sensor_name[8][SENSOR_NAME_MAXLEN];
+    float sensor_data[SENSOR_NUM];
+    char sensor_name[SENSOR_NUM][SENSOR_NAME_MAXLEN];
 } i2c_slave_context_t;
 
 i2c_slave_context_t context = {
@@ -93,8 +95,16 @@ i2c_slave_context_t context = {
     .wifi_started = false,
     .ret_cmd_mutex = NULL,
     .sensor_mutex = NULL,
+    .name_mutex = NULL,
     .http_server = NULL,
-    .sensor_data = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+    .sensor_data = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+    .sensor_name = {
+        "Temperature",
+        "Humidity",
+        "Light",
+        "Ultrasound",
+        "Magnetic"
+    }
 };
 
 // ===== mDNS ======
@@ -250,14 +260,13 @@ static esp_err_t status_handler(httpd_req_t *req)
 
     // Get current status
     uint8_t door_state, fan_level, light_level;
-    float sensor_snapshot[8];
     xSemaphoreTake(context.ret_cmd_mutex, portMAX_DELAY);
     door_state = context.response_data[1];
     fan_level = context.response_data[2];
     light_level = context.response_data[3];
     xSemaphoreGive(context.ret_cmd_mutex);
 
-    // Compose JSON response with door_state, fan_level, light_level, and sensor_data
+    // Compose JSON response with door_state, fan_level, light_level
     char response[256];
     int len = snprintf(response, sizeof(response),
                        "{\"door_state\":%d,\"fan_level\":%d,\"light_level\":%d}",
@@ -273,17 +282,46 @@ static esp_err_t sensor_handler(httpd_req_t *req)
     ESP_LOGI("HTTP", "Received sensor request");
 
     // Get current status
-    float sensor_snapshot[8];
+    float sensor_snapshot[SENSOR_NUM];
     xSemaphoreTake(context.sensor_mutex, portMAX_DELAY);
     memcpy(sensor_snapshot, context.sensor_data, sizeof(sensor_snapshot));
     xSemaphoreGive(context.sensor_mutex);
+    
+    uint8_t door_state, fan_level, light_level;
+    xSemaphoreTake(context.ret_cmd_mutex, portMAX_DELAY);
+    door_state = context.response_data[1];
+    fan_level = context.response_data[2];
+    light_level = context.response_data[3];
+    xSemaphoreGive(context.ret_cmd_mutex);
+
+    // Compose JSON response with sensor_data
+    char response[256];
+    int len = snprintf(response, sizeof(response),
+                       "{\"sensor_data\":[%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d]}",
+                       sensor_snapshot[0], sensor_snapshot[1], sensor_snapshot[2], sensor_snapshot[3],
+                       sensor_snapshot[4], door_state, fan_level, light_level);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_sendstr(req, response);
+    return ESP_OK;
+}
+static esp_err_t name_handler(httpd_req_t *req)
+{
+    ESP_LOGI("HTTP", "Received name request");
+
+    // Get current status
+    char sensor_name[SENSOR_NUM][SENSOR_NAME_MAXLEN] = {0};
+    xSemaphoreTake(context.name_mutex, portMAX_DELAY);
+    memcpy(sensor_name, context.sensor_name, sizeof(sensor_name));
+    xSemaphoreGive(context.name_mutex);
 
     // Compose JSON response with door_state, fan_level, light_level, and sensor_data
     char response[256];
     int len = snprintf(response, sizeof(response),
-                       "{\"sensor_data\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]}",
-                       sensor_snapshot[0], sensor_snapshot[1], sensor_snapshot[2], sensor_snapshot[3],
-                       sensor_snapshot[4], sensor_snapshot[5], sensor_snapshot[6], sensor_snapshot[7]);
+                       "{\"sensor_name\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}",
+                       sensor_name[0], sensor_name[1], sensor_name[2], sensor_name[3],
+                       sensor_name[4]);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -379,7 +417,7 @@ static void http_server_task(void *arg)
         .user_ctx = NULL};
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &set_cmd_uri));
 
-    // /status GET handler for polling
+    // /status GET handler for status polling
     httpd_uri_t status_uri = {
         .uri = "/status",
         .method = HTTP_GET,
@@ -387,13 +425,21 @@ static void http_server_task(void *arg)
         .user_ctx = NULL};
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status_uri));
 
-    // /sensor GET handler for polling
+    // /sensor GET handler for sensor polling
     httpd_uri_t sensor_uri = {
         .uri = "/sensor",
         .method = HTTP_GET,
         .handler = sensor_handler,
         .user_ctx = NULL};
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sensor_uri));
+
+    // /name GET handler for name polling
+    httpd_uri_t name_uri = {
+        .uri = "/name",
+        .method = HTTP_GET,
+        .handler = name_handler,
+        .user_ctx = NULL};
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &name_uri));
 
     // Universal file handler for all requests
     httpd_uri_t file_uri = {
@@ -464,7 +510,7 @@ static void i2c_slave_task(void *arg)
                     uint8_t cmd_len = cmd_buf[0];
                     uint8_t *cmd_data = &cmd_buf[1];
                     uint8_t cmd = cmd_data[0];
-                    ESP_LOGI("I2C", "Processing RX cmd 0x%02X of length %d", cmd, cmd_len);
+                    ESP_LOGI("I2C", "ProcesSsing RX cmd 0x%02X of length %d", cmd, cmd_len);
                     switch (cmd)
                     {
                     case CMD_MDNS_NAME:
@@ -534,8 +580,10 @@ static void i2c_slave_task(void *arg)
                     case CMD_SENSOR_READ:
                     {
                         // sensor read
-                        if (cmd_len == 5)
+                        if (cmd_len == 6)
                         {
+                            context.sensor_data[cmd_data[1]] = *((float *)&cmd_data[2]);
+                            ESP_LOGI("I2C", "Sensor data received - %s: %f", context.sensor_name[cmd_data[1]], context.sensor_data[cmd_data[1]]);
                         }
                         break;
                     }
@@ -661,6 +709,7 @@ extern "C" void app_main(void)
 
     context.ret_cmd_mutex = xSemaphoreCreateMutex();
     context.sensor_mutex = xSemaphoreCreateMutex();
+    context.name_mutex = xSemaphoreCreateMutex();
     // Create RX command queue (pointer to malloc'd buffers)
     context.cmd_queue = xQueueCreate(16, sizeof(uint8_t *));
     if (context.cmd_queue == NULL)
