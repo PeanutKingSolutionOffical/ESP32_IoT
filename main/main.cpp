@@ -49,7 +49,8 @@ This is necessary to prevent the I2C slave from blocking the master when it is n
 #define CMD_MDNS_NAME 0x30
 #define CMD_WIFI_SSID 0x31
 #define CMD_WIFI_PASS 0x32
-#define CMD_WIFI_START 0x33
+#define CMD_WIFI_STA_START 0x33
+#define CMD_WIFI_AP_START 0x34
 
 #define CMD_SENSOR_READ 0x40
 #define CMD_SENSOR_SETUP 0x41
@@ -74,7 +75,7 @@ typedef struct
     char wifi_ssid[WIFI_SSID_MAXLEN];
     char wifi_pass[WIFI_PASS_MAXLEN];
     char mdns_name[MDNS_NAME_MAXLEN];
-    uint8_t response_data[4];           // [0]=padding, [1]=door, [2]=fan, [3]=light
+    uint8_t response_data[4]; // [0]=padding, [1]=door, [2]=fan, [3]=light
     bool wifi_started;
     SemaphoreHandle_t ret_cmd_mutex;
     SemaphoreHandle_t sensor_mutex;
@@ -90,7 +91,7 @@ i2c_slave_context_t context = {
     .cmd_queue = NULL,
     .wifi_ssid = "",
     .wifi_pass = "",
-    .mdns_name = "esp32-iot",
+    .mdns_name = "iot",
     .response_data = {0x69, 0, 0, 0},
     .wifi_started = false,
     .ret_cmd_mutex = NULL,
@@ -103,13 +104,11 @@ i2c_slave_context_t context = {
         "Humidity",
         "Light",
         "Ultrasound",
-        "Magnetic"
-    }
-};
+        "Magnetic"}};
 
 // ===== mDNS ======
 
-static void initialise_mdns(const char *hostname = "esp32-iot")
+static void initialise_mdns(const char *hostname = "iot")
 {
     // Initialize mDNS
     ESP_ERROR_CHECK(mdns_init());
@@ -130,7 +129,7 @@ static EventGroupHandle_t s_wifi_event_group;
 /* The event group allows multiple bits for each event, but we only care about two events:
  * - we are connected to the AP with an IP
  * - we failed to connect after the maximum amount of retries */
-#define WIFI_CONNECTED_BIT BIT0 
+#define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 
 static const char *TAG = "wifi station";
@@ -220,6 +219,30 @@ void wifi_init_sta(void)
     }
 }
 
+// Wi-Fi init for AP mode (ESP32 be Wi-Fi AP, devices connect to ESP32)
+void wifi_init_ap(void)
+{
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    wifi_config_t ap_config = {};
+    strlcpy((char *)ap_config.ap.ssid, context.wifi_ssid, sizeof(ap_config.ap.ssid));
+    ap_config.ap.ssid_len = strlen(context.wifi_ssid);
+    strlcpy((char *)ap_config.ap.password, context.wifi_pass, sizeof(ap_config.ap.password));
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+    if (strlen(context.wifi_pass) == 0)
+    {
+        ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI("wifi", "WiFi AP started. SSID:%s password:%s", context.wifi_ssid, context.wifi_pass);
+}
+
 // ===== SPIFFS File Server =====
 // ===== Set Command Handler =====
 static esp_err_t set_cmd_handler(httpd_req_t *req)
@@ -240,14 +263,14 @@ static esp_err_t set_cmd_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid value");
         return ESP_FAIL;
     }
-    
+
     xSemaphoreTake(context.ret_cmd_mutex, portMAX_DELAY);
-    //context.response_data[0] = 0x69; // Padding/garbage, no need change
+    // context.response_data[0] = 0x69; // Padding/garbage, no need change
     context.response_data[1] = (uint8_t)door;
     context.response_data[2] = (uint8_t)fan;
     context.response_data[3] = (uint8_t)light;
     xSemaphoreGive(context.ret_cmd_mutex);
-    
+
     ESP_LOGI("HTTP", "Updated: door=%d, fan=%d, light=%d", door, fan, light);
     httpd_resp_sendstr(req, "OK");
     return ESP_OK;
@@ -286,7 +309,7 @@ static esp_err_t sensor_handler(httpd_req_t *req)
     xSemaphoreTake(context.sensor_mutex, portMAX_DELAY);
     memcpy(sensor_snapshot, context.sensor_data, sizeof(sensor_snapshot));
     xSemaphoreGive(context.sensor_mutex);
-    
+
     uint8_t door_state, fan_level, light_level;
     xSemaphoreTake(context.ret_cmd_mutex, portMAX_DELAY);
     door_state = context.response_data[1];
@@ -563,7 +586,7 @@ static void i2c_slave_task(void *arg)
                         }
                         break;
                     }
-                    case CMD_WIFI_START:
+                    case CMD_WIFI_STA_START:
                     {
                         if (context.wifi_started)
                         {
@@ -571,6 +594,20 @@ static void i2c_slave_task(void *arg)
                             break;
                         }
                         wifi_init_sta();
+                        context.wifi_started = true;
+
+                        // Restart HTTP server if needed
+                        xTaskCreate(http_server_task, "http_server_task", 4096, NULL, 6, NULL);
+                        break;
+                    }
+                    case CMD_WIFI_AP_START:
+                    {
+                        if (context.wifi_started)
+                        {
+                            ESP_LOGW("I2C", "WiFi already started");
+                            break;
+                        }
+                        wifi_init_ap();
                         context.wifi_started = true;
 
                         // Restart HTTP server if needed
@@ -659,6 +696,7 @@ extern "C" void app_main(void)
     initialise_mdns();
 
     esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
 
     // Initialize SPIFFS
     esp_vfs_spiffs_conf_t spiffs_conf = {
@@ -702,7 +740,7 @@ extern "C" void app_main(void)
         .sda_io_num = I2C_SLAVE_SDA_IO,
         .scl_io_num = I2C_SLAVE_SCL_IO,
         .clk_source = I2C_CLK_SRC_DEFAULT,
-        .send_buf_depth = 4,                    // 4 bytes
+        .send_buf_depth = 4, // 4 bytes
         .receive_buf_depth = 150,
         .slave_addr = ESP_SLAVE_ADDR,
     };
