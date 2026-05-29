@@ -5,22 +5,22 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.portWin": "COM3",
+  "idf.portWin": "COM8",
   "idf.toolsPathWin": "C:\\Users\\Admins\\.espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
-  "clangd.path": "C:\\Users\\Admins\\.espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\16.0.1-fe4f10a809\\esp-clang\\bin\\clangd.exe",
   "clangd.arguments": [
     "--background-index",
-    "--query-driver=C:\\Users\\Admins\\.espressif\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin\\xtensa-esp32-elf-gcc.exe",
-    "--compile-commands-dir=${workspaceFolder}\\build"
+    "--query-driver=**",
+    "--compile-commands-dir=c:\\Users\\Admins\\Documents\\GitHub\\ESP32_IoT\\build"
   ],
   "idf.flashType": "UART",
   "files.associations": {
     "cstring": "cpp",
     "atomic": "cpp"
   },
-  "liveServer.settings.root": "/data"
+  "liveServer.settings.root": "/data",
+  "idf.currentSetup": "C:/Espressif/frameworks/esp-idf-v5.3.1/"
 }
-

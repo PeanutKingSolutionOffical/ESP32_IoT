@@ -18,7 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "driver/i2c_slave.h"
+#include "driver/i2c.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -69,9 +69,6 @@ enum units
 
 typedef struct
 {
-    i2c_slave_dev_handle_t slave_handle;
-    QueueHandle_t event_queue;
-    QueueHandle_t cmd_queue;
     char wifi_ssid[WIFI_SSID_MAXLEN];
     char wifi_pass[WIFI_PASS_MAXLEN];
     char mdns_name[MDNS_NAME_MAXLEN];
@@ -86,9 +83,6 @@ typedef struct
 } i2c_slave_context_t;
 
 i2c_slave_context_t context = {
-    .slave_handle = NULL,
-    .event_queue = NULL,
-    .cmd_queue = NULL,
     .wifi_ssid = "",
     .wifi_pass = "",
     .mdns_name = "iot",
@@ -105,6 +99,63 @@ i2c_slave_context_t context = {
         "Light",
         "Ultrasound",
         "Magnetic"}};
+
+static void log_runtime_ready(void)
+{
+    ESP_LOGI("STATUS", "ESP32 IoT firmware booted");
+    ESP_LOGI("STATUS", "I2C slave ready on SDA=%d SCL=%d addr=0x%02X", I2C_SLAVE_SDA_IO, I2C_SLAVE_SCL_IO, ESP_SLAVE_ADDR);
+    ESP_LOGI("STATUS", "Send I2C command 0x50 then read 4 bytes to verify link");
+    ESP_LOGI("STATUS", "Available commands: MDNS=0x30 SSID=0x31 PASS=0x32 STA=0x33 AP=0x34 SENSOR=0x40 SEND_DATA=0x50");
+}
+
+static void log_i2c_bytes(const char *label, const uint8_t *data, size_t len)
+{
+    char hex_buffer[3 * 16 + 1] = {0};
+    size_t shown = (len < 16) ? len : 16;
+    size_t offset = 0;
+
+    for (size_t index = 0; index < shown && offset < sizeof(hex_buffer); ++index)
+    {
+        offset += snprintf(&hex_buffer[offset], sizeof(hex_buffer) - offset, "%02X%s",
+                           data[index], (index + 1 < shown) ? " " : "");
+    }
+
+    ESP_LOGI("I2C", "%s len=%u bytes=%s%s", label, (unsigned)len, hex_buffer,
+             (len > shown) ? " ..." : "");
+}
+
+static bool should_log_i2c_command(uint8_t cmd)
+{
+    switch (cmd)
+    {
+    case CMD_WIFI_SSID:
+    case CMD_WIFI_PASS:
+    case CMD_WIFI_STA_START:
+    case CMD_WIFI_AP_START:
+    case CMD_MDNS_NAME:
+    case CMD_SEND_DATA:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static esp_err_t queue_response_data(void)
+{
+    uint8_t snapshot[sizeof(context.response_data)];
+
+    xSemaphoreTake(context.ret_cmd_mutex, portMAX_DELAY);
+    memcpy(snapshot, context.response_data, sizeof(snapshot));
+    xSemaphoreGive(context.ret_cmd_mutex);
+    log_i2c_bytes("Queueing TX response", snapshot, sizeof(snapshot));
+
+    int written = i2c_slave_write_buffer((i2c_port_t)I2C_SLAVE_NUM, snapshot, sizeof(snapshot), 0);
+    if (written != (int)sizeof(snapshot))
+    {
+        ESP_LOGW("I2C", "TX queue write incomplete: wrote=%d expected=%u", written, (unsigned)sizeof(snapshot));
+    }
+    return (written == (int)sizeof(snapshot)) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
 
 // ===== mDNS ======
 
@@ -167,6 +218,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 
 void wifi_init_sta(void)
 {
+    ESP_LOGI("STATUS", "Starting WiFi station mode for SSID: %s", context.wifi_ssid);
     s_wifi_event_group = xEventGroupCreate();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -208,10 +260,12 @@ void wifi_init_sta(void)
     if (bits & WIFI_CONNECTED_BIT)
     {
         ESP_LOGI(TAG, "connected to ap");
+        ESP_LOGI("STATUS", "WiFi station is working. Check the IP above and open the web page from that address.");
     }
     else if (bits & WIFI_FAIL_BIT)
     {
         ESP_LOGI(TAG, "Failed to connect");
+        ESP_LOGW("STATUS", "WiFi station failed. Recheck SSID/password sent over I2C.");
     }
     else
     {
@@ -222,6 +276,7 @@ void wifi_init_sta(void)
 // Wi-Fi init for AP mode (ESP32 be Wi-Fi AP, devices connect to ESP32)
 void wifi_init_ap(void)
 {
+    ESP_LOGI("STATUS", "Starting WiFi access point mode");
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
@@ -241,6 +296,8 @@ void wifi_init_ap(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI("wifi", "WiFi AP started. SSID:%s password:%s", context.wifi_ssid, context.wifi_pass);
+    ESP_LOGI("STATUS", "AP mode is working. Connect a phone/PC to SSID '%s' and then open 192.168.4.1", context.wifi_ssid);
+    ESP_LOGI("STATUS", "HTTP endpoints: /status /sensor /name /set_cmd");
 }
 
 // ===== SPIFFS File Server =====
@@ -271,6 +328,15 @@ static esp_err_t set_cmd_handler(httpd_req_t *req)
     context.response_data[3] = (uint8_t)light;
     xSemaphoreGive(context.ret_cmd_mutex);
 
+    if (queue_response_data() != ESP_OK)
+    {
+        ESP_LOGW("I2C", "Failed to queue response data for master read");
+    }
+    else
+    {
+        ESP_LOGI("STATUS", "HTTP updated response bytes successfully");
+    }
+
     ESP_LOGI("HTTP", "Updated: door=%d, fan=%d, light=%d", door, fan, light);
     httpd_resp_sendstr(req, "OK");
     return ESP_OK;
@@ -291,9 +357,9 @@ static esp_err_t status_handler(httpd_req_t *req)
 
     // Compose JSON response with door_state, fan_level, light_level
     char response[256];
-    int len = snprintf(response, sizeof(response),
-                       "{\"door_state\":%d,\"fan_level\":%d,\"light_level\":%d}",
-                       door_state, fan_level, light_level);
+    snprintf(response, sizeof(response),
+             "{\"door_state\":%d,\"fan_level\":%d,\"light_level\":%d}",
+             door_state, fan_level, light_level);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -319,10 +385,10 @@ static esp_err_t sensor_handler(httpd_req_t *req)
 
     // Compose JSON response with sensor_data
     char response[256];
-    int len = snprintf(response, sizeof(response),
-                       "{\"sensor_data\":[%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d]}",
-                       sensor_snapshot[0], sensor_snapshot[1], sensor_snapshot[2], sensor_snapshot[3],
-                       sensor_snapshot[4], door_state, fan_level, light_level);
+    snprintf(response, sizeof(response),
+             "{\"sensor_data\":[%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d]}",
+             sensor_snapshot[0], sensor_snapshot[1], sensor_snapshot[2], sensor_snapshot[3],
+             sensor_snapshot[4], door_state, fan_level, light_level);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -341,10 +407,10 @@ static esp_err_t name_handler(httpd_req_t *req)
 
     // Compose JSON response with door_state, fan_level, light_level, and sensor_data
     char response[256];
-    int len = snprintf(response, sizeof(response),
-                       "{\"sensor_name\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}",
-                       sensor_name[0], sensor_name[1], sensor_name[2], sensor_name[3],
-                       sensor_name[4]);
+    snprintf(response, sizeof(response),
+             "{\"sensor_name\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}",
+             sensor_name[0], sensor_name[1], sensor_name[2], sensor_name[3],
+             sensor_name[4]);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -473,171 +539,259 @@ static void http_server_task(void *arg)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &file_uri));
 
     ESP_LOGI("HTTP", "HTTP server started with SPIFFS file serving");
+    ESP_LOGI("STATUS", "HTTP server ready. Open '/' or poll /status /sensor /name");
     vTaskDelete(NULL);
 }
 
 // ===== I2C Slave Task =====
 
-typedef enum
+static bool is_i2c_command_byte(uint8_t value)
 {
-    I2C_SLAVE_EVT_RX,
-    I2C_SLAVE_EVT_TX
-} i2c_slave_event_t;
-
-// I2C slave request callback with mutex protection
-static bool i2c_slave_request_cb(i2c_slave_dev_handle_t i2c_slave, const i2c_slave_request_event_data_t *evt_data, void *arg)
-{
-    uint32_t write_len = 0;
-    xSemaphoreTake(context.ret_cmd_mutex, 0);
-    i2c_slave_write(i2c_slave, context.response_data, 4, &write_len, 0);
-    xSemaphoreGive(context.ret_cmd_mutex);
-    return false;
+    switch (value)
+    {
+    case CMD_MDNS_NAME:
+    case CMD_WIFI_SSID:
+    case CMD_WIFI_PASS:
+    case CMD_WIFI_STA_START:
+    case CMD_WIFI_AP_START:
+    case CMD_SENSOR_READ:
+    case CMD_SENSOR_SETUP:
+    case CMD_SEND_DATA:
+        return true;
+    default:
+        return false;
+    }
 }
 
-// I2C slave receive callback (unchanged)
-static bool i2c_slave_receive_cb(i2c_slave_dev_handle_t i2c_slave, const i2c_slave_rx_done_event_data_t *evt_data, void *arg)
+static bool is_fixed_length_command(uint8_t cmd)
 {
-    i2c_slave_event_t evt = I2C_SLAVE_EVT_RX;
-    BaseType_t xTaskWoken = 0;
-    // Allocate buffer for command and copy data
-    uint8_t *cmd_buf = (uint8_t *)malloc(evt_data->length + 1); // +1 for length
-    if (cmd_buf)
+    switch (cmd)
     {
-        cmd_buf[0] = evt_data->length;
-        memcpy(&cmd_buf[1], evt_data->buffer, evt_data->length);
-        if (xQueueSendFromISR(context.cmd_queue, &cmd_buf, &xTaskWoken) != pdPASS)
-        {
-            // cmd_queue full, dropping command
-            free(cmd_buf);
-            esp_rom_printf("cmd_queue full, dropping command\n");
-        }
+    case CMD_WIFI_STA_START:
+    case CMD_WIFI_AP_START:
+    case CMD_SEND_DATA:
+    case CMD_SENSOR_READ:
+        return true;
+    default:
+        return false;
     }
-    xQueueSendFromISR(context.event_queue, &evt, &xTaskWoken);
-    return xTaskWoken;
+}
+
+static size_t get_fixed_frame_length(uint8_t cmd)
+{
+    switch (cmd)
+    {
+    case CMD_WIFI_STA_START:
+    case CMD_WIFI_AP_START:
+    case CMD_SEND_DATA:
+        return 1;
+    case CMD_SENSOR_READ:
+        return 6;
+    default:
+        return 0;
+    }
+}
+
+static void handle_i2c_command_frame(uint8_t cmd, const uint8_t *payload, size_t payload_len)
+{
+    uint8_t frame_buffer[150];
+    size_t frame_len = payload_len + 1;
+    frame_buffer[0] = cmd;
+    if (payload_len > 0)
+    {
+        memcpy(&frame_buffer[1], payload, payload_len);
+    }
+
+    bool log_command = should_log_i2c_command(cmd);
+    if (log_command)
+    {
+        ESP_LOGI("I2C", "Processing RX cmd 0x%02X of length %u", cmd, (unsigned)frame_len);
+        log_i2c_bytes("RX frame", frame_buffer, frame_len);
+    }
+
+    switch (cmd)
+    {
+    case CMD_MDNS_NAME:
+    {
+        if (payload_len > 0)
+        {
+            size_t mdns_len = payload_len;
+            if (mdns_len > MDNS_NAME_MAXLEN)
+                mdns_len = MDNS_NAME_MAXLEN;
+            memcpy(context.mdns_name, payload, mdns_len);
+            context.mdns_name[mdns_len] = '\0';
+            mdns_hostname_set(context.mdns_name);
+            ESP_LOGI("I2C", "mDNS name set to: %s", context.mdns_name);
+            ESP_LOGI("STATUS", "Device hostname should answer as %s.local", context.mdns_name);
+        }
+        break;
+    }
+    case CMD_WIFI_SSID:
+    {
+        if (context.wifi_started)
+        {
+            ESP_LOGW("I2C", "Cannot set WiFi SSID while WiFi is started");
+            break;
+        }
+        if (payload_len > 0)
+        {
+            size_t ssid_len = payload_len;
+            if (ssid_len > WIFI_SSID_MAXLEN - 1)
+                ssid_len = WIFI_SSID_MAXLEN - 1;
+            memcpy(context.wifi_ssid, payload, ssid_len);
+            context.wifi_ssid[ssid_len] = '\0';
+            ESP_LOGI("I2C", "Wifi SSID set to %s", context.wifi_ssid);
+            ESP_LOGI("STATUS", "Stored WiFi SSID length=%u", (unsigned)ssid_len);
+        }
+        break;
+    }
+    case CMD_WIFI_PASS:
+    {
+        if (context.wifi_started)
+        {
+            ESP_LOGW("I2C", "Cannot set WiFi password while WiFi is started");
+            break;
+        }
+        if (payload_len > 0)
+        {
+            size_t pass_len = payload_len;
+            if (pass_len > WIFI_PASS_MAXLEN - 1)
+                pass_len = WIFI_PASS_MAXLEN - 1;
+            memcpy(context.wifi_pass, payload, pass_len);
+            context.wifi_pass[pass_len] = '\0';
+            ESP_LOGI("I2C", "Wifi password updated");
+            ESP_LOGI("STATUS", "Stored WiFi password length=%u", (unsigned)pass_len);
+        }
+        break;
+    }
+    case CMD_WIFI_STA_START:
+    {
+        if (context.wifi_started)
+        {
+            ESP_LOGW("I2C", "WiFi already started");
+            break;
+        }
+        wifi_init_sta();
+        context.wifi_started = true;
+        ESP_LOGI("STATUS", "I2C requested WiFi STA start");
+
+        xTaskCreate(http_server_task, "http_server_task", 4096, NULL, 6, NULL);
+        break;
+    }
+    case CMD_WIFI_AP_START:
+    {
+        if (context.wifi_started)
+        {
+            ESP_LOGW("I2C", "WiFi already started");
+            break;
+        }
+        wifi_init_ap();
+        context.wifi_started = true;
+        ESP_LOGI("STATUS", "I2C requested WiFi AP start");
+
+        xTaskCreate(http_server_task, "http_server_task", 4096, NULL, 6, NULL);
+        break;
+    }
+    case CMD_SENSOR_READ:
+    {
+        if (payload_len == 5 && payload[0] < SENSOR_NUM)
+        {
+            context.sensor_data[payload[0]] = *((float *)&payload[1]);
+        }
+        else
+        {
+            ESP_LOGW("I2C", "Invalid sensor frame payload_len=%u sensor_index=%u", (unsigned)payload_len, (payload_len > 0) ? payload[0] : 0xFF);
+        }
+        break;
+    }
+    case CMD_SENSOR_SETUP:
+    {
+        if (payload_len > 0)
+            ESP_LOGI("I2C", "Sensor data updated");
+        break;
+    }
+    case CMD_SEND_DATA:
+    {
+        if (queue_response_data() != ESP_OK)
+        {
+            ESP_LOGW("I2C", "Failed to queue response data for CMD_SEND_DATA");
+        }
+        else
+        {
+            ESP_LOGI("STATUS", "I2C read check OK. Response bytes queued: [%u, %u, %u, %u]",
+                     context.response_data[0], context.response_data[1], context.response_data[2], context.response_data[3]);
+        }
+        break;
+    }
+    default:
+    {
+        ESP_LOGW("I2C", "Unknown command 0x%02X", cmd);
+        break;
+    }
+    }
 }
 
 static void i2c_slave_task(void *arg)
 {
-    i2c_slave_dev_handle_t slave_handle = (i2c_slave_dev_handle_t)context.slave_handle;
+    uint8_t cmd_data[150];
 
     while (true)
     {
-        i2c_slave_event_t evt;
-        if (xQueueReceive(context.event_queue, &evt, 10) == pdPASS)
+        int cmd_len = i2c_slave_read_buffer((i2c_port_t)I2C_SLAVE_NUM, cmd_data, sizeof(cmd_data), pdMS_TO_TICKS(10));
+        if (cmd_len > 0)
         {
-            if (evt == I2C_SLAVE_EVT_RX)
+            size_t offset = 0;
+
+            while (offset < (size_t)cmd_len)
             {
-                uint8_t *cmd_buf = NULL;
-                while (xQueueReceive(context.cmd_queue, &cmd_buf, 0) == pdPASS)
+                if (!is_i2c_command_byte(cmd_data[offset]))
                 {
-                    uint8_t cmd_len = cmd_buf[0];
-                    uint8_t *cmd_data = &cmd_buf[1];
-                    uint8_t cmd = cmd_data[0];
-                    ESP_LOGI("I2C", "ProcesSsing RX cmd 0x%02X of length %d", cmd, cmd_len);
-                    switch (cmd)
-                    {
-                    case CMD_MDNS_NAME:
-                    {
-                        if (cmd_len > 1)
-                        {
-                            size_t mdns_len = cmd_len - 1;
-                            if (mdns_len > MDNS_NAME_MAXLEN)
-                                mdns_len = MDNS_NAME_MAXLEN;
-                            memcpy(context.mdns_name, &cmd_data[1], mdns_len);
-                            context.mdns_name[mdns_len] = '\0';
-                            mdns_hostname_set(context.mdns_name);
-                            ESP_LOGI("I2C", "mDNS name set to: %s", context.mdns_name);
-                        }
-                        break;
-                    }
-                    case CMD_WIFI_SSID:
-                    {
-                        if (context.wifi_started)
-                        {
-                            ESP_LOGW("I2C", "Cannot set WiFi SSID while WiFi is started");
-                            break;
-                        }
-                        if (cmd_len > 1)
-                        {
-                            size_t ssid_len = cmd_len - 1;
-                            if (ssid_len > WIFI_SSID_MAXLEN)
-                                ssid_len = WIFI_SSID_MAXLEN;
-                            memcpy(context.wifi_ssid, &cmd_data[1], ssid_len);
-                            context.wifi_ssid[ssid_len] = '\0';
-                            ESP_LOGI("I2C", "Wifi SSID set to %s", context.wifi_ssid);
-                        }
-                        break;
-                    }
-                    case CMD_WIFI_PASS:
-                    {
-                        if (context.wifi_started)
-                        {
-                            ESP_LOGW("I2C", "Cannot set WiFi password while WiFi is started");
-                            break;
-                        }
-                        if (cmd_len > 1)
-                        {
-                            size_t pass_len = cmd_len - 1;
-                            if (pass_len > WIFI_PASS_MAXLEN)
-                                pass_len = WIFI_PASS_MAXLEN;
-                            memcpy(context.wifi_pass, &cmd_data[1], pass_len);
-                            context.wifi_pass[pass_len] = '\0';
-                            ESP_LOGI("I2C", "Wifi Password set to %s", context.wifi_pass);
-                        }
-                        break;
-                    }
-                    case CMD_WIFI_STA_START:
-                    {
-                        if (context.wifi_started)
-                        {
-                            ESP_LOGW("I2C", "WiFi already started");
-                            break;
-                        }
-                        wifi_init_sta();
-                        context.wifi_started = true;
-
-                        // Restart HTTP server if needed
-                        xTaskCreate(http_server_task, "http_server_task", 4096, NULL, 6, NULL);
-                        break;
-                    }
-                    case CMD_WIFI_AP_START:
-                    {
-                        if (context.wifi_started)
-                        {
-                            ESP_LOGW("I2C", "WiFi already started");
-                            break;
-                        }
-                        wifi_init_ap();
-                        context.wifi_started = true;
-
-                        // Restart HTTP server if needed
-                        xTaskCreate(http_server_task, "http_server_task", 4096, NULL, 6, NULL);
-                        break;
-                    }
-                    case CMD_SENSOR_READ:
-                    {
-                        // sensor read
-                        if (cmd_len == 6)
-                        {
-                            context.sensor_data[cmd_data[1]] = *((float *)&cmd_data[2]);
-                            ESP_LOGI("I2C", "Sensor data received - %s: %f", context.sensor_name[cmd_data[1]], context.sensor_data[cmd_data[1]]);
-                        }
-                        break;
-                    }
-                    case CMD_SENSOR_SETUP:
-                    {
-                        if (cmd_len > 1)
-                            ESP_LOGI("I2C", "Sensor data updated");
-                        break;
-                    }
-                    default:
-                    {
-                        // Unknown command
-                        break;
-                    }
-                    }
-                    free(cmd_buf);
+                    ESP_LOGW("I2C", "Discarding unexpected byte 0x%02X at offset %u", cmd_data[offset], (unsigned)offset);
+                    ++offset;
+                    continue;
                 }
+
+                uint8_t cmd = cmd_data[offset];
+                size_t remaining = (size_t)cmd_len - offset;
+
+                if (is_fixed_length_command(cmd))
+                {
+                    size_t frame_len = get_fixed_frame_length(cmd);
+                    if (remaining < frame_len)
+                    {
+                        ESP_LOGW("I2C", "Incomplete fixed frame for cmd 0x%02X at offset %u", cmd, (unsigned)offset);
+                        break;
+                    }
+                    handle_i2c_command_frame(cmd, &cmd_data[offset + 1], frame_len - 1);
+                    offset += frame_len;
+                    continue;
+                }
+
+                if (remaining >= 2)
+                {
+                    size_t payload_len = cmd_data[offset + 1];
+                    size_t frame_len = payload_len + 2;
+                    if (frame_len <= remaining)
+                    {
+                        handle_i2c_command_frame(cmd, &cmd_data[offset + 2], payload_len);
+                        offset += frame_len;
+                        continue;
+                    }
+                }
+
+                // Backward-compatible fallback: a single legacy variable-length frame occupying the rest of the burst.
+                if (offset == 0)
+                {
+                    if (should_log_i2c_command(cmd))
+                    {
+                        ESP_LOGW("I2C", "Using legacy variable-length parsing for cmd 0x%02X; prefer [cmd][len][payload] framing", cmd);
+                    }
+                    handle_i2c_command_frame(cmd, &cmd_data[offset + 1], remaining - 1);
+                    break;
+                }
+
+                ESP_LOGW("I2C", "Incomplete variable-length frame for cmd 0x%02X at offset %u", cmd, (unsigned)offset);
+                break;
             }
         }
     }
@@ -645,7 +799,7 @@ static void i2c_slave_task(void *arg)
 }
 
 // debug print function, prints WiFi and mDNS info every second
-static void print_wifi_info_task(void *arg)
+[[maybe_unused]] static void print_wifi_info_task(void *arg)
 {
     while (true)
     {
@@ -735,45 +889,31 @@ extern "C" void app_main(void)
     }
 
     // I2C slave config
-    i2c_slave_config_t conf = {
-        .i2c_port = I2C_SLAVE_NUM,
-        .sda_io_num = I2C_SLAVE_SDA_IO,
-        .scl_io_num = I2C_SLAVE_SCL_IO,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .send_buf_depth = 4, // 4 bytes
-        .receive_buf_depth = 150,
-        .slave_addr = ESP_SLAVE_ADDR,
-    };
+    i2c_config_t conf = {};
+    conf.mode = I2C_MODE_SLAVE;
+    conf.sda_io_num = I2C_SLAVE_SDA_IO;
+    conf.scl_io_num = I2C_SLAVE_SCL_IO;
+    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.slave.addr_10bit_en = 0;
+    conf.slave.slave_addr = ESP_SLAVE_ADDR;
+    conf.slave.maximum_speed = 400000;
+    conf.clk_flags = I2C_SCLK_SRC_FLAG_FOR_NOMAL;
 
     context.ret_cmd_mutex = xSemaphoreCreateMutex();
     context.sensor_mutex = xSemaphoreCreateMutex();
     context.name_mutex = xSemaphoreCreateMutex();
-    // Create RX command queue (pointer to malloc'd buffers)
-    context.cmd_queue = xQueueCreate(16, sizeof(uint8_t *));
-    if (context.cmd_queue == NULL)
+    ESP_ERROR_CHECK(i2c_param_config((i2c_port_t)I2C_SLAVE_NUM, &conf));
+    ESP_ERROR_CHECK(i2c_driver_install((i2c_port_t)I2C_SLAVE_NUM, conf.mode, 150, 16, 0));
+    ESP_LOGI("STATUS", "I2C driver installed with RX buffer=150 TX buffer=16");
+
+    if (queue_response_data() != ESP_OK)
     {
-        ESP_LOGE("I2C", "Failed to create RX command queue");
-        return;
+        ESP_LOGW("I2C", "Initial response data was not queued");
     }
-
-    ESP_ERROR_CHECK(i2c_new_slave_device(&conf, &context.slave_handle));
-
-    // Create event queue for RX/TX events
-    context.event_queue = xQueueCreate(16, sizeof(i2c_slave_event_t));
-    if (context.event_queue == NULL)
-    {
-        ESP_LOGE("I2C", "Failed to create event queue");
-        return;
-    }
-
-    // Register callback in a task
-    i2c_slave_event_callbacks_t cbs = {
-        .on_request = i2c_slave_request_cb,
-        .on_receive = i2c_slave_receive_cb,
-    };
-    ESP_ERROR_CHECK(i2c_slave_register_event_callbacks(context.slave_handle, &cbs, &context));
 
     ESP_LOGI("I2C", "I2C slave initialized on SCL %d, SDA %d", I2C_SLAVE_SCL_IO, I2C_SLAVE_SDA_IO);
+    log_runtime_ready();
 
     xTaskCreate(i2c_slave_task, "i2c_slave_task", 4 * 1024, &context, 10, NULL);
     // xTaskCreate(print_wifi_info_task, "print_wifi_info_task", 4096, &context, 5, NULL);
