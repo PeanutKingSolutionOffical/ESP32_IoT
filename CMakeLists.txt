@@ -9,4 +9,8 @@ project(ESP32_IoT)
 
 # Add SPIFFS image build
 set(SPIFFS_IMAGE_SOURCE_DIR "${CMAKE_SOURCE_DIR}/data")
-spiffs_create_partition_image(storage ${SPIFFS_IMAGE_SOURCE_DIR} FLASH_IN_PROJECT)
+if(NOT IS_DIRECTORY "${SPIFFS_IMAGE_SOURCE_DIR}")
+    message(FATAL_ERROR "SPIFFS source directory not found: ${SPIFFS_IMAGE_SOURCE_DIR}")
+endif()
+
+spiffs_create_partition_image(storage "${SPIFFS_IMAGE_SOURCE_DIR}" FLASH_IN_PROJECT)
